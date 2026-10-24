@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parental Control</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>Parental Control</h1>
+  <p class="sub">Daily limit <b id="limit" class="num">Loading…</b> · <span id="every"></span> · <span id="updated" class="num"></span></p>
+  <p class="toolbar"><button type="button" id="pause">Pause updates</button></p>
+  <p id="msg" role="status"></p>
+  <p id="alert" role="alert"></p>
+  <p id="readonly" class="note" hidden>View only: blocking and resetting are off until this page has a password. Ask the person who set it up.</p>
+  <p id="stalenote" class="note" hidden>Showing the last known times. The list could not update; buttons are off until it does.</p>
+  <noscript><p class="note">This page needs JavaScript to show devices. Turn it on and reload.</p></noscript>
+  <div class="devices" tabindex="0" role="region" aria-label="Devices">
+    <table>
+      <caption class="sr-only">Devices and their time used today</caption>
+      <thead><tr>
+        <th scope="col">Device</th><th scope="col">Used today</th>
+        <th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="4">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <dialog id="confirm" aria-labelledby="confirm-text">
+    <p id="confirm-text"></p>
+    <div class="actions">
+      <button type="button" value="cancel" id="confirm-cancel">Cancel</button>
+      <button type="button" value="ok" id="confirm-ok"></button>
+    </div>
+  </dialog>
+</main>
+</body>
+</html>

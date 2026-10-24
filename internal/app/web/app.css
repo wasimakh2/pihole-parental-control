@@ -1,0 +1,95 @@
+:root {
+  color-scheme: light dark;
+  /* sRGB hex so every browser resolves them. Text roles >= 6.5:1, --control >= 4.5:1, --line >= 3:1 on #fff,
+     and on dark canvases from #121212 to #1e1e1e (body background is pinned to Canvas). */
+  --muted: #595959; --ok: #1b5e20; --warn: #7a4f00; --bad: #b71c1c;
+  --control: #767676; --line: #949494; --track: #e6e6e6;
+  --font: system-ui, sans-serif;
+  --speed-press: 120ms; --speed-release: 80ms; --speed-dialog: 200ms;
+  --backdrop: #00000066;
+  --shadow: #0000002e;
+  --ease-out: cubic-bezier(.23, 1, .32, 1);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --muted: #a3a3a3; --ok: #81c784; --warn: #ffd54f; --bad: #ef9a9a;
+    --control: #8a8a8a; --line: #707070; --track: #2e2e2e;
+  }
+}
+body {
+  font-family: var(--font); line-height: 1.5; background: Canvas; color: CanvasText;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  margin: 0 auto; max-width: 960px;
+  padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) 1rem max(1rem, env(safe-area-inset-left));
+}
+h1 { font-size: 1.4rem; line-height: 1.1; margin: 0 0 .25rem; text-wrap: balance; }
+.sub { color: var(--muted); margin: 0 0 .5rem; font-size: .9rem; text-wrap: pretty; }
+.toolbar { margin: 0 0 1rem; }
+.num { font-variant-numeric: tabular-nums; }
+/* Always rendered: a live region removed from the accessibility tree misses its first message. */
+#msg, #alert { min-height: 1.5rem; font-size: .9rem; margin: 0 0 .5rem; text-wrap: pretty; }
+#msg { color: var(--ok); }
+#msg.pending { color: var(--muted); }
+#alert { color: var(--bad); }
+.note { color: var(--muted); font-size: .9rem; margin: 0 0 1rem; max-width: 65ch; text-wrap: pretty; }
+
+.devices { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: start; padding: .6rem .5rem; border-bottom: 1px solid var(--line); vertical-align: middle; }
+thead th { font-size: .8rem; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+tbody th { font-weight: 500; overflow-wrap: anywhere; }
+.ip { color: var(--muted); font-size: .8rem; font-weight: 400; }
+.hint { display: block; color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; text-wrap: pretty; }
+.hint.ok { color: var(--ok); } .hint.err { color: var(--bad); }
+
+.bar { height: .5rem; margin-top: .3rem; background: var(--track); border: 1px solid var(--line); border-radius: .25rem; overflow: hidden; min-width: 5rem; }
+.bar > span { display: block; height: 100%; background: var(--ok); }
+.bar-near > span { background: var(--warn); }
+.bar-over > span { background: var(--bad); }
+@media (forced-colors: active) { .bar > span { background: CanvasText; } }
+
+.tag { font-size: .8rem; padding: .1rem .5rem; border-radius: 1rem; border: 1px solid currentColor; white-space: nowrap; }
+.tag-blocked { color: var(--bad); } .tag-near { color: var(--warn); } .tag-free { color: var(--muted); } .tag-active { color: var(--ok); }
+/* Out-of-date rows go grey rather than translucent, so text keeps its contrast. */
+tbody.stale .tag, tbody.stale .hint, tbody.stale th, tbody.stale td { color: var(--muted); }
+tbody.stale .bar > span { background: var(--muted); }
+
+.actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+button {
+  font: inherit; min-height: 2.75rem; padding: .4rem .9rem; white-space: nowrap;
+  border-radius: .4rem; border: 1px solid var(--control); background: transparent; color: inherit; cursor: pointer;
+}
+button.danger { color: var(--bad); border-color: currentColor; }
+@media (hover: hover) and (pointer: fine) { button:hover:not([aria-disabled="true"]) { border-color: currentColor; } }
+button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+/* Muted text and line colours, not opacity, so disabled buttons keep readable contrast. */
+button[aria-disabled="true"] { color: var(--muted); border-color: var(--line); cursor: default; }
+/* Pressed feedback that needs no motion. */
+button:active:not([aria-disabled="true"]) { background: var(--track); }
+@media (prefers-reduced-motion: no-preference) {
+  button { transition: transform var(--speed-release) var(--ease-out); }
+  button:active:not([aria-disabled="true"]) { transform: scale(.96); transition-duration: var(--speed-press); }
+  dialog[open] { animation: dialog-in var(--speed-dialog) var(--ease-out); }
+  @keyframes dialog-in { from { opacity: 0; transform: scale(.96); } }
+}
+/* Reduced motion keeps the fade, drops the scale. */
+@media (prefers-reduced-motion: reduce) {
+  dialog[open] { animation: dialog-fade var(--speed-dialog) linear; }
+  @keyframes dialog-fade { from { opacity: 0; } }
+}
+
+/* Radius = button radius + padding, so the corners stay concentric. */
+dialog { border: 0; border-radius: 1.4rem; box-shadow: 0 0 0 1px var(--line), 0 8px 24px var(--shadow); overscroll-behavior: contain; padding: 1rem; max-width: min(28rem, calc(100vw - 2rem)); }
+@media (forced-colors: active) { dialog { border: 1px solid CanvasText; } }
+dialog::backdrop { background: var(--backdrop); }
+dialog p { margin: 0 0 1rem; text-wrap: pretty; }
+dialog .actions { justify-content: flex-end; }
+
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+/* Narrow screens (phones and small tablets, up to 640px): stack the buttons and let long labels wrap, so the table fits without sideways scrolling. */
+@media (max-width: 40rem) {
+  th, td { padding-inline: .2rem; }
+  td .actions { flex-direction: column; gap: .75rem; }
+  .bar { min-width: 3rem; }
+  button { padding-inline: .6rem; }
+}

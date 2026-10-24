@@ -4,10 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
+	"slices"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/vladikamira/pihole-parental-control/internal/config"
@@ -27,29 +33,20 @@ type Client struct {
 	client            *http.Client
 	sessionID         string
 	sessionExpiration time.Time
+	// mu serialises the exported calls: the poll loop and the HTTP handlers
+	// share one session and would otherwise race on sessionID.
+	mu sync.Mutex
 }
 
-func (c *Client) Auth(ctx context.Context) error {
+func (c *Client) auth(ctx context.Context) error {
 	if c.sessionID != "" && time.Now().Before(c.sessionExpiration) {
 		return nil
 	}
 
-	data, err := json.Marshal(map[string]string{"password": c.config.Password})
+	resp, err := c.send(ctx, http.MethodPost, "/api/auth", map[string]string{"password": c.config.Password})
 	if err != nil {
 		return err
 	}
-
-	req, err := http.NewRequest("POST", c.config.PiholeAddress+"/api/auth", bytes.NewBuffer(data))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -68,62 +65,96 @@ func (c *Client) Auth(ctx context.Context) error {
 	c.sessionID = authResponse.Session.Sid
 	c.sessionExpiration = time.Now().Add(time.Duration(authResponse.Session.Validity) * time.Second)
 
-	fmt.Println("Auth successeded. Got session id: ", c.sessionID)
+	fmt.Println("Auth succeeded")
 
 	return nil
 }
 
-func (c *Client) GetDomainStats(ctx context.Context, domain string) (*QueryStats, error) {
-	if err := c.Auth(ctx); err != nil {
-		return nil, err
+// send builds and runs one API request; body, when non-nil, is sent as JSON.
+func (c *Client) send(ctx context.Context, method, path string, body any) (*http.Response, error) {
+	var payload io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		payload = bytes.NewReader(data)
 	}
-
-	from := strconv.FormatInt(time.Now().Add(-c.config.CheckInternal).Unix(), 10)
-	until := strconv.FormatInt(time.Now().Unix(), 10)
-
-	req, err := http.NewRequest("GET", c.config.PiholeAddress+"/api/queries?domain="+domain+"&from="+from+"&until="+until, nil)
+	req, err := http.NewRequestWithContext(ctx, method, c.config.PiholeAddress+path, payload)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-FTL-SID", c.sessionID)
-
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.sessionID != "" {
+		req.Header.Set("X-FTL-SID", c.sessionID)
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		// Pi-hole dropped the session (restart, timeout); log in again next call.
+		c.sessionID = ""
+	}
+	return resp, nil
+}
+
+// call runs a request, fails on any non-2xx status and decodes the reply into out when non-nil.
+func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
+	resp, err := c.send(ctx, method, path, body)
+	if err != nil {
+		return err
+	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("%s %s: %s", method, path, resp.Status)
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) GetDomainStats(ctx context.Context, domain string) (*QueryStats, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.auth(ctx); err != nil {
 		return nil, err
 	}
+
+	q := url.Values{}
+	q.Set("domain", domain)
+	q.Set("from", strconv.FormatInt(time.Now().Add(-c.config.CheckInternal).Unix(), 10))
+	q.Set("until", strconv.FormatInt(time.Now().Unix(), 10))
+
 	var stats QueryStats
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		return nil, err
+	if err := c.call(ctx, http.MethodGet, "/api/queries?"+q.Encode(), nil, &stats); err != nil {
+		return nil, fmt.Errorf("query stats failed: %w", err)
 	}
 	return &stats, nil
 }
 
 func (c *Client) BlockDomainsForClient(ctx context.Context, clientIP string, domains []string) error {
-	if err := c.Auth(ctx); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.auth(ctx); err != nil {
 		return err
 	}
 
-	groupName := fmt.Sprintf("ParentalControl-%s", clientIP)
+	groupName := groupNameFor(clientIP)
 	groupID, err := c.getOrCreateGroup(ctx, groupName)
 	if err != nil {
 		return fmt.Errorf("failed to get/create group: %w", err)
 	}
 
-	fmt.Printf("Group %s created with id: %d\n", groupName, groupID)
-
-	// Add domains to group
 	for _, domain := range domains {
-		fmt.Printf("Adding domain %s to group: %d\n", domain, groupID)
-		if err := c.addDomainToGroup(ctx, domain, groupID); err != nil {
+		if err := c.addDomainToGroup(ctx, GlobToRegex(domain), groupID); err != nil {
 			return fmt.Errorf("failed to add domain %s: %w", domain, err)
 		}
 	}
 
-	// Add client to group
 	if err := c.addClientToGroup(ctx, clientIP, groupID); err != nil {
 		return fmt.Errorf("failed to add client to group: %w", err)
 	}
@@ -131,18 +162,23 @@ func (c *Client) BlockDomainsForClient(ctx context.Context, clientIP string, dom
 	return nil
 }
 
+// UnblockDomainsForClient succeeds when the client is already unblocked, so a
+// reset works even if this app restarted and forgot the device was blocked.
 func (c *Client) UnblockDomainsForClient(ctx context.Context, clientIP string) error {
-	if err := c.Auth(ctx); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.auth(ctx); err != nil {
 		return err
 	}
 
-	groupName := fmt.Sprintf("ParentalControl-%s", clientIP)
-	groupID, err := c.getGroupID(ctx, groupName)
+	groupID, err := c.getGroupID(ctx, groupNameFor(clientIP))
+	if errors.Is(err, errNotFound) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get group id: %w", err)
 	}
 
-	// Remove client from group
 	if err := c.removeClientFromGroup(ctx, clientIP, groupID); err != nil {
 		return fmt.Errorf("failed to remove client from group: %w", err)
 	}
@@ -150,217 +186,150 @@ func (c *Client) UnblockDomainsForClient(ctx context.Context, clientIP string) e
 	return nil
 }
 
-// Helpers
+// IsBlocked reports whether the client is in its parental-control group.
+func (c *Client) IsBlocked(ctx context.Context, clientIP string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.auth(ctx); err != nil {
+		return false, err
+	}
+	groupID, err := c.getGroupID(ctx, groupNameFor(clientIP))
+	if errors.Is(err, errNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	client, err := c.getClient(ctx, clientIP)
+	if errors.Is(err, errNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(client.Groups, groupID), nil
+}
+
+var errNotFound = errors.New("not found")
+
+func groupNameFor(clientIP string) string {
+	return "ParentalControl-" + clientIP
+}
+
+// GlobToRegex turns a TRACKED_DOMAINS pattern such as "*.ytimg.com" into an
+// anchored regex, so dots match only dots and "*" spans any characters.
+func GlobToRegex(glob string) string {
+	parts := strings.Split(glob, "*")
+	for i, p := range parts {
+		parts[i] = regexp.QuoteMeta(p)
+	}
+	return "^" + strings.Join(parts, ".*") + "$"
+}
 
 func (c *Client) getOrCreateGroup(ctx context.Context, name string) (int, error) {
 	id, err := c.getGroupID(ctx, name)
-	if err == nil {
-		return id, nil
+	if !errors.Is(err, errNotFound) {
+		return id, err
 	}
 
-	// Create group
-	data, _ := json.Marshal(map[string]string{
-		"name":        name,
-		"description": "Created by Parental Control",
-	})
-	req, _ := http.NewRequest("POST", c.config.PiholeAddress+"/api/groups", bytes.NewBuffer(data))
-	req.Header.Set("X-FTL-SID", c.sessionID)
-	req.Header.Set("Content-Type", "application/json") // Ensure Content-Type is set
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return 0, fmt.Errorf("failed to create group, status: %d", resp.StatusCode)
-	}
-
-	// Assume response contains ID? Or we fetch again.
-	// Pi-hole v6 API usually returns the object.
 	var res GroupResponse
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		// Fallback: fetch by name
+	body := map[string]string{"name": name, "description": "Created by Parental Control"}
+	if err := c.call(ctx, http.MethodPost, "/api/groups", body, &res); err != nil {
+		return 0, fmt.Errorf("failed to create group: %w", err)
+	}
+	if len(res.Groups) == 0 {
 		return c.getGroupID(ctx, name)
 	}
-	fmt.Println("Group created with id: ", res.Groups[0].ID)
+	fmt.Printf("Group %s created with id: %d\n", name, res.Groups[0].ID)
 	return res.Groups[0].ID, nil
 }
 
 func (c *Client) getGroupID(ctx context.Context, name string) (int, error) {
-	req, _ := http.NewRequest("GET", c.config.PiholeAddress+"/api/groups", nil)
-	req.Header.Set("X-FTL-SID", c.sessionID)
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
 	var groups GroupListResponse
-	// Note: Response structure might differ, simplified assumption
-	if err := json.NewDecoder(resp.Body).Decode(&groups); err != nil {
+	if err := c.call(ctx, http.MethodGet, "/api/groups/"+url.PathEscape(name), nil, &groups); err != nil {
 		return 0, err
 	}
-
 	for _, g := range groups.Groups {
 		if g.Name == name {
 			return g.ID, nil
 		}
 	}
-	return 0, fmt.Errorf("group not found")
+	return 0, fmt.Errorf("group %s: %w", name, errNotFound)
 }
 
-func (c *Client) addDomainToGroup(ctx context.Context, domain string, groupID int) error {
-	// Add domain (blacklist regex or exact)
-	payload := map[string]interface{}{
-		"domain":  domain,
-		"comment": "Parental Control",
-		"groups":  []int{groupID},
-		"enabled": true,
+// addDomainToGroup reuses an existing deny rule: one rule serves every
+// device's group, and a second POST of the same rule would be rejected.
+func (c *Client) addDomainToGroup(ctx context.Context, regex string, groupID int) error {
+	path := "/api/domains/deny/regex/" + url.PathEscape(regex)
+	var existing struct {
+		Domains []DomainItem `json:"domains"`
 	}
-	data, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", c.config.PiholeAddress+"/api/domains/deny/regex", bytes.NewBuffer(data))
-	req.Header.Set("X-FTL-SID", c.sessionID)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
+	if err := c.call(ctx, http.MethodGet, path, nil, &existing); err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("add domain failed: %d, body: %s", resp.StatusCode, string(body))
+	if len(existing.Domains) == 0 {
+		body := map[string]any{"domain": regex, "comment": "Parental Control", "groups": []int{groupID}, "enabled": true}
+		return c.call(ctx, http.MethodPost, "/api/domains/deny/regex", body, nil)
 	}
 
-	return nil
+	d := existing.Domains[0]
+	if d.Enabled && slices.Contains(d.Groups, groupID) {
+		return nil
+	}
+	if !slices.Contains(d.Groups, groupID) {
+		d.Groups = append(d.Groups, groupID)
+	}
+	body := map[string]any{"comment": d.Comment, "groups": d.Groups, "enabled": true}
+	return c.call(ctx, http.MethodPut, path, body, nil)
 }
 
 func (c *Client) addClientToGroup(ctx context.Context, ip string, groupID int) error {
-	// First get client to preserve existing groups
 	client, err := c.getClient(ctx, ip)
-	exists := true
-	if err != nil {
-		// Client might not exist in database, create query
-		// But in Pi-hole clients are identified by IP.
-		// If we POST a new client, we specify groups.
-		client = &ClientItem{IP: ip, Groups: []int{}}
-		exists = false
+	if errors.Is(err, errNotFound) {
+		return c.call(ctx, http.MethodPost, "/api/clients", &ClientItem{IP: ip, Groups: []int{groupID}}, nil)
 	}
-
-	// Check if already in group
-	for _, gid := range client.Groups {
-		if gid == groupID {
-			return nil
-		}
+	if err != nil {
+		return err
+	}
+	if slices.Contains(client.Groups, groupID) {
+		return nil
 	}
 	client.Groups = append(client.Groups, groupID)
-
-	if !exists {
-		return c.createClient(ctx, client)
-	}
-
 	return c.updateClient(ctx, client)
 }
 
 func (c *Client) removeClientFromGroup(ctx context.Context, ip string, groupID int) error {
 	client, err := c.getClient(ctx, ip)
+	if errors.Is(err, errNotFound) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get client: %w", err)
 	}
-
-	newGroups := []int{}
-	found := false
-	for _, gid := range client.Groups {
-		if gid == groupID {
-			found = true
-			continue
-		}
-		newGroups = append(newGroups, gid)
+	if !slices.Contains(client.Groups, groupID) {
+		return nil
 	}
-
-	if !found {
-		return fmt.Errorf("client %s not found in group %d", ip, groupID)
-	}
-	client.Groups = newGroups
+	client.Groups = slices.DeleteFunc(client.Groups, func(g int) bool { return g == groupID })
 	return c.updateClient(ctx, client)
 }
 
 func (c *Client) getClient(ctx context.Context, ip string) (*ClientItem, error) {
-	// Need to list clients or get specific?
-	// Assuming GET /api/clients/{ip} or search
-	req, _ := http.NewRequest("GET", c.config.PiholeAddress+"/api/clients", nil) // List all?
-	req.Header.Set("X-FTL-SID", c.sessionID)
-	resp, err := c.client.Do(req)
-	if err != nil {
-		fmt.Printf("getClient network error: %v\n", err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	// fmt.Printf("DEBUG: getClient response: %s\n", string(bodyBytes))
-
 	var response struct {
 		Clients []ClientItem `json:"clients"`
 	}
-	// Try parsing as wrapped object
-	if err := json.Unmarshal(bodyBytes, &response); err != nil {
-		// Try parsing as array directly?
-		// Some versions might return just []ClientItem
-		var clients []ClientItem
-		if err2 := json.Unmarshal(bodyBytes, &clients); err2 == nil {
-			response.Clients = clients
-		} else {
-			fmt.Printf("getClient decode error: %v\nBody: %s\n", err, string(bodyBytes))
-			return nil, err
-		}
+	if err := c.call(ctx, http.MethodGet, "/api/clients/"+url.PathEscape(ip), nil, &response); err != nil {
+		return nil, err
 	}
-
 	for _, cl := range response.Clients {
 		if cl.IP == ip {
 			return &cl, nil
 		}
 	}
-	fmt.Printf("getClient: IP %s not found in %d clients\n", ip, len(response.Clients))
-	return nil, fmt.Errorf("client not found")
-}
-
-func (c *Client) createClient(ctx context.Context, client *ClientItem) error {
-	data, _ := json.Marshal(client)
-	req, _ := http.NewRequest("POST", c.config.PiholeAddress+"/api/clients", bytes.NewBuffer(data))
-	req.Header.Set("X-FTL-SID", c.sessionID)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("create client failed: %d, body: %s", resp.StatusCode, string(body))
-	}
-	return nil
+	return nil, fmt.Errorf("client %s: %w", ip, errNotFound)
 }
 
 func (c *Client) updateClient(ctx context.Context, client *ClientItem) error {
-	data, _ := json.Marshal(client)
-	// Use PUT and append IP to URL for update
-	req, _ := http.NewRequest("PUT", c.config.PiholeAddress+"/api/clients/"+client.IP, bytes.NewBuffer(data))
-	req.Header.Set("X-FTL-SID", c.sessionID)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("update client failed: %d, body: %s", resp.StatusCode, string(body))
-	}
-	return nil
+	body := map[string]any{"comment": client.Comment, "groups": client.Groups}
+	return c.call(ctx, http.MethodPut, "/api/clients/"+url.PathEscape(client.IP), body, nil)
 }

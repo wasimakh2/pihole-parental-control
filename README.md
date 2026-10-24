@@ -55,12 +55,21 @@ The application is configured via environment variables:
 | `PIHOLE_PASSWORD` | Your Pi-hole admin password | `secretpassword` |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token for notifications | `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` |
 | `TELEGRAM_CHAT_ID` | Chat ID where notifications will be sent | `123456789` |
-| `DAYLY_WATCHING_LIMIT` | Daily watching limit (default: 1h) | `2h`, `1h30m` |
+| `DAILY_WATCHING_LIMIT` | Daily watching limit (default: 1h). The older spelling `DAYLY_WATCHING_LIMIT` still works | `2h`, `1h30m` |
 | `SPEAKER_URL` | URL of the `simple-google-speaker` service | `http://192.168.1.50:8080` |
 | `SPEAKER_LANGUAGE` | Language for voice messages (default: `en`) | `ru`, `en` |
 | `SPEAKER_NEAR_LIMIT_MESSAGE` | Voice message when < 5 mins left | `Wrap it up.` |
 | `SPEAKER_LIMIT_REACHED_MESSAGE` | Voice message when limit reached | `Time is up.` |
 | `API_PORT` | Port for the API server (default: `8081`) | `8081` |
+| `LIMITED_CLIENTS` | Comma-separated client IPs the limit applies to. Unset = every client (original behaviour). Other clients are still shown in the UI | `100.100.232.87,100.81.231.4` |
+| `TRACKED_DOMAINS` | Comma-separated domain patterns to track and block. `*` matches any characters; each pattern becomes an anchored Pi-hole deny regex. Unset = built-in YouTube list | `*youtube*,*googlevideo*,*.ytimg.com` |
+| `UI_PASSWORD` | Password for the web UI and API (HTTP Basic auth, any username). Required for Block and Reset: without it the UI is read-only, so a limited device cannot unblock itself. Five wrong passwords lock that address out for a minute | `change-me` |
+| `TZ` | Timezone for the midnight reset | `Asia/Kolkata` |
+
+Open `http://<host>:<API_PORT>/` for the web UI: every device seen querying the tracked domains, time used today, and buttons to block a device now or reset its time.
+
+> [!WARNING]
+> Basic auth sends the password with every request. Plain HTTP is only safe on an encrypted network such as Tailscale or WireGuard, or behind an HTTPS reverse proxy. Do not expose the port to the internet.
 
 ### Run via Go
 
@@ -149,9 +158,12 @@ curl -X POST "http://localhost:8081/reset?ip=192.168.1.15"
   - `ip`: The IP address of the client to reset and unblock.
 - **Success Response**: `200 OK`
 - **Error Responses**:
-  - `400 Bad Request`: Missing `ip` parameter.
+  - `400 Bad Request`: Missing or invalid `ip` parameter.
+  - `403 Forbidden`: `UI_PASSWORD` unset, or the `X-Parental-Control` header is missing.
   - `404 Not Found`: Client not found in current statistics.
-  - `500 Internal Server Error`: Failed to communicate with Pi-hole.
+  - `502 Bad Gateway`: Pi-hole did not answer.
+
+With `UI_PASSWORD` set, add `-u any:<password> -H 'X-Parental-Control: 1'` to the curl call. `POST /block?ip=...` blocks a client the same way.
 
 #### Get Current Statistics
 
@@ -163,4 +175,4 @@ curl "http://localhost:8081/stats"
 
 - **URL**: `/stats`
 - **Method**: `GET`
-- **Success Response**: `200 OK` with JSON body containing monitored domains, global counter, and per-client data (IP, time watched, blocked status, etc.).
+- **Success Response**: `200 OK` with JSON body containing monitored domains, global counter, and per-client data (IP, time watched, blocked status, etc.) and `read_only`, true when `UI_PASSWORD` is unset.

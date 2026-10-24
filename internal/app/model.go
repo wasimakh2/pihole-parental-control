@@ -23,7 +23,14 @@ type App struct {
 	speakerClient *speaker.Client
 	stats         DomainStats
 	mu            sync.RWMutex
+	// actionMu serialises block/unblock decisions with their Pi-hole calls, so a
+	// concurrent reset and block cannot leave memory and Pi-hole disagreeing.
+	actionMu sync.Mutex
+	limiter  *failLimiter
 }
+
+// piholeTimeout bounds one block, unblock or stats call, below the UI's 20 s wait.
+const piholeTimeout = 15 * time.Second
 
 type Client struct {
 	RequestsToday     int              `json:"requests_today"`
@@ -33,10 +40,13 @@ type Client struct {
 	LastQueryTime     time.Time        `json:"last_query_time"`
 	Blocked           bool             `json:"blocked"`
 	NotifiedNearLimit bool             `json:"notified_near_limit"`
+	Name              string           `json:"name"`
+	Limited           bool             `json:"limited"`
 }
 
 type DomainStats struct {
-	Domains     []string  `json:"domains"`
-	GlobalCount int       `json:"global_count"`
-	Clients     []*Client `json:"clients"`
+	Domains     []string      `json:"domains"`
+	GlobalCount int           `json:"global_count"`
+	Clients     []*Client     `json:"clients"`
+	DailyLimit  time.Duration `json:"daily_limit_ns"`
 }
